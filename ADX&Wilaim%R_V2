@@ -1,0 +1,190 @@
+# Install required packages if needed
+!pip install yfinance ta openpyxl --quiet
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+from datetime import datetime
+
+# -----------------------------
+# 1. Download Price Data
+# -----------------------------
+start_date = "2010-01-01"
+end_date   = "2025-04-11"  # Until today as specified
+ticker     = "BEL.NS"      # BEL ticker on NSE
+
+# Constant values for Williams %R reference bands (not varied here)
+wr_upper_band = -25
+wr_lower_band = -75
+
+# Download daily price data
+df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+if df.empty:
+    raise Exception("No data downloaded. Please check the ticker or date range.")
+print("Data download complete.")
+
+# -----------------------------
+# 2. Resample Data to Weekly
+# -----------------------------
+weekly = pd.DataFrame()
+weekly['Open']   = df['Open'].resample('W').first()
+weekly['High']   = df['High'].resample('W').max()
+weekly['Low']    = df['Low'].resample('W').min()
+weekly['Close']  = df['Close'].resample('W').last()
+weekly['Volume'] = df['Volume'].resample('W').sum()
+weekly.dropna(inplace=True)
+
+# -----------------------------
+# 3. Grid Search over Parameters & Backtest
+# -----------------------------
+results = []  # To store metrics for each parameter combination
+
+# Iterate over adx_win values from 10 to 20 (inclusive)
+for adx_win in range(10, 10):
+    # Iterate over wr_lb values from 100 to 250 in steps of 10
+    for wr_lb in range(140, 150, 1):
+        # Copy the weekly data for this iteration
+        data = weekly.copy()
+
+        # Calculate the ADX indicator using the current adx_win window.
+        adx_indicator = ta.trend.ADXIndicator(
+            high=data['High'], 
+            low=data['Low'], 
+            close=data['Close'], 
+            window=adx_win, 
+            fillna=False
+        )
+        data['ADX'] = adx_indicator.adx()
+
+        # Calculate the Williams %R indicator using the current wr_lb lookback.
+        wr_indicator = ta.momentum.WilliamsRIndicator(
+            high=data['High'], 
+            low=data['Low'], 
+            close=data['Close'], 
+            lbp=wr_lb, 
+            fillna=False
+        )
+        data['WilliamsR'] = wr_indicator.williams_r()
+
+        # -----------------------------
+        # 4. Generate Trading Signals
+        # -----------------------------
+        # Buy signal: ADX > 40 and Williams %R > wr_upper_band (-25)
+        data['Buy_Signal'] = (data['ADX'] > 40) & (data['WilliamsR'] > wr_upper_band)
+        # Sell signal: when Williams %R falls below wr_upper_band
+        data['Sell_Signal'] = (data['WilliamsR'] < wr_upper_band)
+
+        # -----------------------------
+        # 5. Backtest the Strategy (no plotting)
+        # -----------------------------
+        in_position = False
+        entry_price = 0.0
+        entry_date = None
+        trades = []
+
+        # Loop over weekly data and trade at next week's open to avoid lookahead bias.
+        for i in range(len(data) - 1):
+            current_date = data.index[i]
+            next_date = data.index[i+1]
+            current_row = data.iloc[i]
+            next_row = data.iloc[i+1]
+            
+            if not in_position:
+                if current_row['Buy_Signal']:
+                    entry_price = next_row['Open']  # Buy at next week's open
+                    entry_date = next_date
+                    in_position = True
+            else:
+                if current_row['Sell_Signal']:
+                    exit_price = next_row['Open']  # Sell at next week's open
+                    exit_date = next_date
+                    profit_pct = (exit_price - entry_price) / entry_price * 100
+                    trades.append({
+                        'Entry Date': entry_date,
+                        'Exit Date': exit_date,
+                        'Entry Price': entry_price,
+                        'Exit Price': exit_price,
+                        'Profit %': profit_pct
+                    })
+                    in_position = False
+
+        # Close any open position at the end of the period.
+        if in_position:
+            exit_price = data.iloc[-1]['Close']
+            exit_date = data.index[-1]
+            profit_pct = (exit_price - entry_price) / entry_price * 100
+            trades.append({
+                'Entry Date': entry_date,
+                'Exit Date': exit_date,
+                'Entry Price': entry_price,
+                'Exit Price': exit_price,
+                'Profit %': profit_pct
+            })
+
+        trades_df = pd.DataFrame(trades)
+
+        # Calculate metrics; if no trades were executed, record NaN values.
+        if trades_df.empty:
+            results.append({
+                'adx_win': adx_win,
+                'wr_lb': wr_lb,
+                'Total Trades': 0,
+                'Successful Trades': 0,
+                'Max Loss Trade (%)': np.nan,
+                'Win Sum (%)': np.nan,
+                'Loss Sum (%)': np.nan,
+                'Cumulative Return (%)': np.nan,
+                'Win Rate (%)': np.nan
+            })
+            continue
+
+        # Total trades executed.
+        total_trades = trades_df.shape[0]
+        # Successful trades count (trades with a positive return).
+        wins = trades_df[trades_df['Profit %'] > 0].shape[0]
+        # Sum of winning trade percentages.
+        total_profit_percentage = trades_df[trades_df['Profit %'] > 0]['Profit %'].sum()
+        # Sum of losing trade percentages (this will be negative).
+        total_loss_percentage = trades_df[trades_df['Profit %'] < 0]['Profit %'].sum()
+        # Overall compounded cumulative return.
+        cumulative_return = (np.prod(1 + trades_df['Profit %'] / 100) - 1) * 100
+        # Maximum loss trade (i.e. worst single trade)
+        max_loss_trade = trades_df['Profit %'].min()
+
+        win_rate = wins / total_trades * 100
+
+        results.append({
+            'adx_win': adx_win,
+            'wr_lb': wr_lb,
+            'Total Trades': total_trades,
+            'Successful Trades': wins,
+            'Max Loss Trade (%)': max_loss_trade,
+            'Win Sum (%)': total_profit_percentage,
+            'Loss Sum (%)': total_loss_percentage,
+            'Cumulative Return (%)': cumulative_return,
+            'Win Rate (%)': win_rate
+        })
+
+# Convert the results to a DataFrame.
+results_df = pd.DataFrame(results)
+print("Grid Search Results:")
+print(results_df.to_string(index=False))
+
+# -----------------------------
+# 6. Identify Top 3 Parameter Combinations by Cumulative Return (%)
+# -----------------------------
+top3 = results_df.sort_values(by='Cumulative Return (%)', ascending=False).head(3)
+print("\nTop 3 combinations by Cumulative Return (%):")
+print(top3.to_string(index=False))
+
+# -----------------------------
+# 7. Save the Results to an Excel File
+# -----------------------------
+excel_file = "grid_search_results.xlsx"
+results_df.to_excel(excel_file, index=False)
+print(f"\nResults have been saved to {excel_file}.")
+
+# If using Google Colab, uncomment the lines below to trigger a download automatically.
+#from google.colab import files
+#files.download(excel_file)
